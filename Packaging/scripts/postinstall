@@ -1,0 +1,116 @@
+#!/bin/sh
+# Installs a per-user LaunchAgent so FinderHotKey starts at login. The agent is
+# configured to relaunch only after a crash, not after the user chooses Quit.
+set -e
+
+LABEL="local.tgs.finderhotkey"
+APP="/Applications/FinderHotKey.app"
+
+# The Installer runs as root; find the user actually logged in at the console.
+CONSOLE_USER=$(stat -f '%Su' /dev/console 2>/dev/null || true)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    exit 0
+fi
+
+UID_NUM=$(id -u "$CONSOLE_USER")
+USER_GROUP=$(id -gn "$CONSOLE_USER")
+USER_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+    USER_HOME="/Users/$CONSOLE_USER"
+fi
+
+# Never create an agent that points at a missing binary.
+if [ ! -x "$APP/Contents/MacOS/FinderHotKey" ]; then
+    FOUND=$(/usr/bin/mdfind -onlyin /Applications "kMDItemCFBundleIdentifier == '$LABEL'" 2>/dev/null | head -n 1)
+    if [ -n "$FOUND" ] && [ -x "$FOUND/Contents/MacOS/FinderHotKey" ]; then
+        APP="$FOUND"
+    else
+        exit 0
+    fi
+fi
+
+LA_DIR="$USER_HOME/Library/LaunchAgents"
+PLIST="$LA_DIR/$LABEL.plist"
+NEW_PREFS="$USER_HOME/Library/Preferences/$LABEL.plist"
+
+xattr -dr com.apple.quarantine "$APP" >/dev/null 2>&1 || true
+
+mkdir -p "$LA_DIR"
+
+# Remove stale agents left by earlier builds under a different identifier.
+# Their preferences are carried over once, then the old domain is deleted.
+for OLD_PLIST in "$LA_DIR"/*.plist; do
+    [ -f "$OLD_PLIST" ] || continue
+    [ "$OLD_PLIST" = "$PLIST" ] && continue
+
+    PROGRAM=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$OLD_PLIST" 2>/dev/null || true)
+    case "$PROGRAM" in
+        *FinderHotKey.app/Contents/MacOS/FinderHotKey) ;;
+        *) continue ;;
+    esac
+
+    OLD_LABEL=$(/usr/libexec/PlistBuddy -c "Print :Label" "$OLD_PLIST" 2>/dev/null || true)
+    if [ -z "$OLD_LABEL" ]; then
+        OLD_LABEL=$(basename "$OLD_PLIST" .plist)
+    fi
+
+    OLD_PREFS="$USER_HOME/Library/Preferences/$OLD_LABEL.plist"
+    if [ -f "$OLD_PREFS" ] && [ ! -f "$NEW_PREFS" ]; then
+        cp "$OLD_PREFS" "$NEW_PREFS" 2>/dev/null || true
+        chown "$CONSOLE_USER":"$USER_GROUP" "$NEW_PREFS" 2>/dev/null || true
+        chmod 644 "$NEW_PREFS" 2>/dev/null || true
+    fi
+    rm -f "$OLD_PREFS"
+
+    launchctl asuser "$UID_NUM" launchctl bootout "gui/$UID_NUM/$OLD_LABEL" >/dev/null 2>&1 || true
+    launchctl asuser "$UID_NUM" /usr/bin/tccutil reset Accessibility "$OLD_LABEL" >/dev/null 2>&1 || true
+    rm -f "$OLD_PLIST"
+done
+
+cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$APP/Contents/MacOS/FinderHotKey</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/dev/null</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/null</string>
+</dict>
+</plist>
+EOF
+
+chown "$CONSOLE_USER":"$USER_GROUP" "$PLIST"
+chmod 644 "$PLIST"
+
+# Stop any running instance, including one started manually.
+launchctl asuser "$UID_NUM" /usr/bin/pkill -f "$APP/Contents/MacOS/FinderHotKey" >/dev/null 2>&1 || true
+
+# Start fresh: stop the old job, clear the stale grant (ad-hoc signatures bind
+# the permission to the binary's cdhash), then load the new agent.
+launchctl asuser "$UID_NUM" launchctl bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+launchctl asuser "$UID_NUM" /usr/bin/tccutil reset Accessibility "$LABEL" >/dev/null 2>&1 || true
+launchctl asuser "$UID_NUM" launchctl bootstrap "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || true
+
+# Drop receipts from older package identifiers so only one record remains.
+for RECEIPT in $(/usr/sbin/pkgutil --pkgs 2>/dev/null | grep -i 'finderhotkey' || true); do
+    [ "$RECEIPT" = "$LABEL.pkg" ] && continue
+    /usr/sbin/pkgutil --forget "$RECEIPT" >/dev/null 2>&1 || true
+done
+
+exit 0
