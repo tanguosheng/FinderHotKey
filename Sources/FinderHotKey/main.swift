@@ -13,7 +13,7 @@ private enum HotKeyID: UInt32, CaseIterable {
 
     var title: String {
         switch self {
-        case .openFinder: return "打开访达（主目录）"
+        case .openFinder: return "打开访达"
         case .minimizeFrontWindow: return "最小化当前窗口"
         case .toggleDesktop: return "显示桌面"
         }
@@ -59,14 +59,118 @@ private enum HotKeySettings {
         UserDefaults.standard.set(keyCode, forKey: key(id, "keyCode"))
         UserDefaults.standard.set(modifiers, forKey: key(id, "modifiers"))
     }
+}
 
-    static func resetAll() {
-        let defaults = UserDefaults.standard
-        for id in HotKeyID.allCases {
-            defaults.removeObject(forKey: key(id, "enabled"))
-            defaults.removeObject(forKey: key(id, "keyCode"))
-            defaults.removeObject(forKey: key(id, "modifiers"))
+/// General app preferences.
+private enum AppSettings {
+    private static let statusBarIconKey = "ui.showStatusBarIcon"
+    private static let finderPathKey = "finder.openPath"
+
+    /// The menu bar icon is shown unless the user turns it off.
+    static var showsStatusBarIcon: Bool {
+        guard let number = UserDefaults.standard.object(forKey: statusBarIconKey) as? NSNumber else {
+            return true
         }
+        return number.boolValue
+    }
+
+    static func setShowsStatusBarIcon(_ visible: Bool) {
+        UserDefaults.standard.set(visible, forKey: statusBarIconKey)
+    }
+
+    /// Folder opened by the “打开访达” hot key. `nil` means the home folder.
+    static var finderPath: String? {
+        UserDefaults.standard.string(forKey: finderPathKey)
+    }
+
+    static func setFinderPath(_ path: String) {
+        UserDefaults.standard.set(path, forKey: finderPathKey)
+    }
+
+    private static let toastHoldKey = "ui.toastHoldMilliseconds"
+    private static let toastFadeKey = "ui.toastFadeMilliseconds"
+    private static let toastVisibleKey = "ui.showToast"
+    private static let toastBackgroundColorKey = "ui.toastBackgroundColor"
+    private static let toastTextColorKey = "ui.toastTextColor"
+
+    static let defaultToastHoldMilliseconds = 600
+    static let defaultToastFadeMilliseconds = 200
+    static let defaultToastBackgroundColor = NSColor(srgbRed: 0x4C / 255.0,
+                                                    green: 0x4C / 255.0,
+                                                    blue: 0x4C / 255.0,
+                                                    alpha: 1)
+    static let defaultToastTextColor = NSColor.white
+
+    /// The trigger hint is shown unless the user turns it off.
+    static var showsToast: Bool {
+        guard let number = UserDefaults.standard.object(forKey: toastVisibleKey) as? NSNumber else {
+            return true
+        }
+        return number.boolValue
+    }
+
+    static func setShowsToast(_ visible: Bool) {
+        UserDefaults.standard.set(visible, forKey: toastVisibleKey)
+    }
+
+    static var toastBackgroundColor: NSColor {
+        storedColor(forKey: toastBackgroundColorKey, fallback: defaultToastBackgroundColor)
+    }
+
+    static func setToastBackgroundColor(_ color: NSColor) {
+        store(color, forKey: toastBackgroundColorKey)
+    }
+
+    static var toastTextColor: NSColor {
+        storedColor(forKey: toastTextColorKey, fallback: defaultToastTextColor)
+    }
+
+    static func setToastTextColor(_ color: NSColor) {
+        store(color, forKey: toastTextColorKey)
+    }
+
+    private static func storedColor(forKey key: String, fallback: NSColor) -> NSColor {
+        guard let components = UserDefaults.standard.array(forKey: key) as? [Double],
+              components.count == 4 else {
+            return fallback
+        }
+        return NSColor(srgbRed: components[0],
+                       green: components[1],
+                       blue: components[2],
+                       alpha: components[3])
+    }
+
+    private static func store(_ color: NSColor, forKey key: String) {
+        guard let srgb = color.usingColorSpace(.sRGB) else { return }
+        UserDefaults.standard.set([srgb.redComponent,
+                                   srgb.greenComponent,
+                                   srgb.blueComponent,
+                                   srgb.alphaComponent],
+                                  forKey: key)
+    }
+
+    /// How long the trigger hint stays fully visible, in milliseconds.
+    static var toastHoldMilliseconds: Int {
+        guard let number = UserDefaults.standard.object(forKey: toastHoldKey) as? NSNumber else {
+            return defaultToastHoldMilliseconds
+        }
+        return min(5000, max(0, number.intValue))
+    }
+
+    static func setToastHoldMilliseconds(_ value: Int) {
+        UserDefaults.standard.set(min(5000, max(0, value)), forKey: toastHoldKey)
+    }
+
+    /// Fade-out duration of the trigger hint, in milliseconds.
+    static var toastFadeMilliseconds: Int {
+        guard let number = UserDefaults.standard.object(forKey: toastFadeKey) as? NSNumber else {
+            return defaultToastFadeMilliseconds
+        }
+        return min(5000, max(0, number.intValue))
+    }
+
+    static func setToastFadeMilliseconds(_ value: Int) {
+        UserDefaults.standard.set(min(5000, max(0, value)), forKey: toastFadeKey)
     }
 }
 
@@ -168,10 +272,75 @@ private func shortcutDescription(keyCode: UInt32, modifiers: UInt32) -> String {
     modifierSymbols(modifiers) + keyName(for: keyCode)
 }
 
+/// Shortcut label for the trigger hint: modifier glyphs and the key rendered in
+/// one font, so the whole string stays visually even.
+private func shortcutHUDText(keyCode: UInt32, modifiers: UInt32) -> String {
+    let symbols = modifierSymbols(modifiers)
+    let key = keyName(for: keyCode)
+    return symbols.isEmpty ? key : "\(symbols) \(key)"
+}
+
 // MARK: - Finder
 
+private var automationAlertShown = false
+
+private func showAutomationAlertIfNeeded() {
+    guard !automationAlertShown else { return }
+    automationAlertShown = true
+    DispatchQueue.main.async {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "FinderHotKey 需要控制“访达”的权限"
+        alert.informativeText = "为了每次按快捷键都新开一个访达窗口，需要允许 FinderHotKey 自动控制“访达”。请在“系统设置 › 隐私与安全性 › 自动化”中勾选 FinderHotKey 下的“访达”，然后重试。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+private func appleScriptStringLiteral(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+/// AppleScript runs serially off the main thread: the first run may wait for the
+/// Automation permission prompt and must not block the UI.
+private let finderScriptQueue = DispatchQueue(label: "local.tgs.finderhotkey.finder")
+
 private func openFinder() {
-    NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory()))
+    var isDirectory: ObjCBool = false
+    let configuredPath = AppSettings.finderPath ?? NSHomeDirectory()
+    // A previously chosen folder may have been moved or deleted.
+    let path = FileManager.default.fileExists(atPath: configuredPath, isDirectory: &isDirectory) && isDirectory.boolValue
+        ? configuredPath
+        : NSHomeDirectory()
+
+    let literalPath = appleScriptStringLiteral(path)
+
+    finderScriptQueue.async {
+        // `NSWorkspace.open` only activates an existing window for the same
+        // folder, so ask Finder itself for a new window. Finder owns the
+        // placement, so the window never moves after it appears.
+        let source = """
+        tell application "Finder"
+            activate
+            make new Finder window to (POSIX file "\(literalPath)" as alias)
+        end tell
+        """
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        guard let error = error else { return }
+        // Only a permission denial is guaranteed to happen before any window is
+        // created. Other failures may have already opened a window, and falling
+        // back there would open the folder a second time.
+        guard (error[NSAppleScript.errorNumber] as? Int) == -1743 else { return }
+        showAutomationAlertIfNeeded()
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
 }
 
 // MARK: - AX helpers
@@ -220,12 +389,6 @@ private struct OnScreenWindowInfo {
 private struct DisplayBounds {
     let id: CGDirectDisplayID
     let bounds: CGRect
-}
-
-private struct OrderedWindow {
-    let pid: pid_t
-    let frame: CGRect
-    let display: CGDirectDisplayID
 }
 
 /// All normal on-screen windows in the current space, ordered front to back.
@@ -285,27 +448,6 @@ private func displayID(for frame: CGRect, in displays: [DisplayBounds]) -> CGDir
     }?.id
 }
 
-/// Windows grouped by display: current display first (front to back),
-/// then every other display in the order its frontmost window appears.
-private func orderedWindows(allOnScreen: [OnScreenWindowInfo],
-                            displays: [DisplayBounds],
-                            currentDisplay: CGDirectDisplayID?) -> [OrderedWindow] {
-    let annotated: [OrderedWindow] = allOnScreen.compactMap { info in
-        guard let display = displayID(for: info.frame, in: displays) else { return nil }
-        return OrderedWindow(pid: info.pid, frame: info.frame, display: display)
-    }
-    guard let current = currentDisplay else { return annotated }
-
-    var result = annotated.filter { $0.display == current }
-    var added: Set<CGDirectDisplayID> = [current]
-    for window in annotated where !added.contains(window.display) {
-        added.insert(window.display)
-        result.append(contentsOf: annotated.filter { $0.display == window.display })
-    }
-    return result
-}
-
-/// Activates the application and focuses the window matching the given frame.
 private func isFrontmost(_ pid: pid_t) -> Bool {
     NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
 }
@@ -424,18 +566,50 @@ private func focusWindow(pid: pid_t, frame: CGRect, isCancelled: () -> Bool) {
 
 // MARK: - Cascade focus scheduling
 
-private struct PendingCascadeTarget {
-    let window: OrderedWindow
-    let expiresAt: Date
+/// Windows minimized a moment ago. A rapid second press must not pick the same
+/// window again while its minimize animation is still on screen.
+private final class MinimizedWindowStore {
+    private struct Entry {
+        let pid: pid_t
+        let frame: CGRect
+        let date: Date
+    }
+
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+    private let lifetime: TimeInterval = 1.5
+
+    func record(pid: pid_t, frame: CGRect) {
+        lock.lock()
+        pruneLocked()
+        entries.append(Entry(pid: pid, frame: frame, date: Date()))
+        lock.unlock()
+    }
+
+    func contains(pid: pid_t, frame: CGRect) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneLocked()
+        return entries.contains { $0.pid == pid && framesMatch($0.frame, frame) }
+    }
+
+    private func pruneLocked() {
+        let now = Date()
+        entries.removeAll { now.timeIntervalSince($0.date) > lifetime }
+    }
 }
 
-private var pendingCascadeTarget: PendingCascadeTarget?
-private var lastMinimizedPID: pid_t?
-private var lastMinimizedFrame: CGRect?
-private var lastMinimizedAt = Date.distantPast
+private let minimizedWindowStore = MinimizedWindowStore()
 
-private func clearPendingCascadeTarget() {
-    pendingCascadeTarget = nil
+/// Front-to-back on-screen windows that can still take part in the cascade.
+private func cascadeCandidates(limit: Int) -> [OnScreenWindowInfo] {
+    var result: [OnScreenWindowInfo] = []
+    for info in onScreenWindows() where info.pid != getpid() {
+        if minimizedWindowStore.contains(pid: info.pid, frame: info.frame) { continue }
+        result.append(info)
+        if result.count == limit { break }
+    }
+    return result
 }
 
 /// Runs focus changes off the hot-key path so minimizing is immediate even when
@@ -464,9 +638,11 @@ private final class FocusScheduler {
         }
     }
 
-    /// Focuses the next window after a short quiet period. Rapid Cmd+Esc presses
-    /// keep pushing this back, so intermediate apps never flash to the front.
-    func schedule(pid: pid_t, frame: CGRect) {
+    /// Focuses the frontmost remaining window after a short quiet period. Rapid
+    /// Cmd+Esc presses keep pushing this back, so intermediate apps never flash
+    /// to the front. The target is read when the work runs, because presses in
+    /// the meantime have already changed which window is frontmost.
+    func scheduleFrontWindowFocus() {
         lock.lock()
         generation &+= 1
         let gen = generation
@@ -475,10 +651,14 @@ private final class FocusScheduler {
 
         let work = DispatchWorkItem { [weak self] in
             guard let self = self, self.isCurrent(gen) else { return }
+            guard let target = cascadeCandidates(limit: 1).first else {
+                self.finish(gen)
+                return
+            }
             // Mark only when we actually start activating, so a canceled focus
             // never masks a real app switch.
-            self.markExpectedActivation(pid)
-            focusWindow(pid: pid, frame: frame) { !self.isCurrent(gen) }
+            self.markExpectedActivation(target.pid)
+            focusWindow(pid: target.pid, frame: target.frame) { !self.isCurrent(gen) }
             self.finish(gen)
         }
         lock.lock()
@@ -542,7 +722,6 @@ private final class FocusScheduler {
 
         // The user switched to another app: do not pull focus back later.
         cancel()
-        clearPendingCascadeTarget()
     }
 }
 
@@ -552,7 +731,7 @@ private let focusScheduler = FocusScheduler()
 
 private func resolveWindow(pid: pid_t, frame: CGRect) -> (window: AXUIElement, frame: CGRect)? {
     let appElement = AXUIElementCreateApplication(pid)
-    AXUIElementSetMessagingTimeout(appElement, 0.4)
+    AXUIElementSetMessagingTimeout(appElement, 1.0)
 
     // The next cascade window is usually the app's own focused window; check it
     // first to avoid walking every window on the hot-key path.
@@ -572,87 +751,70 @@ private func resolveWindow(pid: pid_t, frame: CGRect) -> (window: AXUIElement, f
     return nil
 }
 
+/// Minimizing runs on its own serial queue: AX calls can be slow for a napping
+/// app, while the hot key itself must return instantly. Every press re-reads the
+/// window list, so a press never depends on a remembered target that rapidly
+/// changing focus could invalidate.
+private final class MinimizeCascade {
+    private let queue = DispatchQueue(label: "local.tgs.finderhotkey.minimize", qos: .userInteractive)
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    func request() {
+        guard isTrusted() else {
+            showPermissionAlertIfNeeded()
+            return
+        }
+        lock.lock()
+        let gen = generation
+        lock.unlock()
+        queue.async {
+            guard self.isCurrent(gen) else { return }
+            self.minimizeFrontWindow()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+    }
+
+    private func isCurrent(_ gen: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation == gen
+    }
+
+    private func minimizeFrontWindow() {
+        guard let candidate = cascadeCandidates(limit: 1).first else {
+            focusScheduler.cancel()
+            return
+        }
+
+        // The frame from the window server can lag a window that is still
+        // animating, so retry the same window once before giving up. Never skip
+        // to a window behind it: that would look like the wrong window vanished.
+        for attempt in 0..<2 {
+            if attempt > 0 { usleep(60_000) }
+            guard let match = resolveWindow(pid: candidate.pid, frame: candidate.frame) else { continue }
+            guard AXUIElementSetAttributeValue(match.window,
+                                               kAXMinimizedAttribute as CFString,
+                                               kCFBooleanTrue) == .success else { continue }
+            minimizedWindowStore.record(pid: candidate.pid, frame: match.frame)
+            focusScheduler.scheduleFrontWindowFocus()
+            return
+        }
+        // Nothing was minimized, so do not pull another app forward: that would
+        // look like the focus disappeared without the window being minimized.
+        focusScheduler.cancel()
+    }
+}
+
+private let minimizeCascade = MinimizeCascade()
+
 private func minimizeFrontWindow() {
-    guard isTrusted() else {
-        showPermissionAlertIfNeeded()
-        return
-    }
-
-    var currentPID: pid_t?
-    var currentFrame: CGRect?
-    var currentWindow: AXUIElement?
-
-    if let front = NSWorkspace.shared.frontmostApplication {
-        let appElement = AXUIElementCreateApplication(front.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, 0.4)
-        if let value = copyAttribute(appElement, kAXFocusedWindowAttribute as String),
-           CFGetTypeID(value) == AXUIElementGetTypeID() {
-            let focused = unsafeBitCast(value, to: AXUIElement.self)
-            // After a press the app may still report the window we just
-            // minimized as focused, so only accept a live window.
-            if let frame = windowFrame(focused), !isMinimized(focused) {
-                let justMinimized = Date().timeIntervalSince(lastMinimizedAt) < 1.0 &&
-                    lastMinimizedPID == front.processIdentifier &&
-                    lastMinimizedFrame.map { framesMatch(frame, $0) } == true
-                if !justMinimized {
-                    currentPID = front.processIdentifier
-                    currentFrame = frame
-                    currentWindow = focused
-                }
-            }
-        }
-    }
-
-    // Rapid presses: focus has not landed on the next window yet, so continue
-    // from the window that is about to be focused instead of stalling.
-    if currentWindow == nil,
-       let pending = pendingCascadeTarget,
-       Date() < pending.expiresAt,
-       let match = resolveWindow(pid: pending.window.pid, frame: pending.window.frame) {
-        currentPID = pending.window.pid
-        currentFrame = match.frame
-        currentWindow = match.window
-    }
-
-    guard let pid = currentPID, let frame = currentFrame, let current = currentWindow else {
-        clearPendingCascadeTarget()
-        focusScheduler.cancel()
-        return
-    }
-
-    let allOnScreen = onScreenWindows()
-    let displays = activeDisplays()
-    let currentDisplay = displayID(for: frame, in: displays)
-    let sequence = orderedWindows(allOnScreen: allOnScreen, displays: displays, currentDisplay: currentDisplay)
-    let currentIndex = sequence.firstIndex { $0.pid == pid && framesMatch($0.frame, frame) }
-
-    guard AXUIElementSetAttributeValue(current, kAXMinimizedAttribute as CFString, kCFBooleanTrue) == .success else {
-        clearPendingCascadeTarget()
-        focusScheduler.cancel()
-        return
-    }
-    lastMinimizedPID = pid
-    lastMinimizedFrame = frame
-    lastMinimizedAt = Date()
-
-    // Stay on this display until its stack is exhausted, then continue on the next display.
-    var target: OrderedWindow?
-    if let index = currentIndex {
-        if index + 1 < sequence.count {
-            target = sequence[index + 1]
-        }
-    } else {
-        target = sequence.first { !($0.pid == pid && framesMatch($0.frame, frame)) }
-    }
-
-    if let next = target {
-        pendingCascadeTarget = PendingCascadeTarget(window: next,
-                                                    expiresAt: Date().addingTimeInterval(1.0))
-        focusScheduler.schedule(pid: next.pid, frame: next.frame)
-    } else {
-        clearPendingCascadeTarget()
-        focusScheduler.cancel()
-    }
+    minimizeCascade.request()
 }
 
 // MARK: - Show desktop toggle (Cmd + D)
@@ -704,7 +866,7 @@ private final class DesktopToggle {
         lastAction = Date()
 
         // Cmd+D takes over focus handling; stop any pending Cmd+Esc focus switch.
-        clearPendingCascadeTarget()
+        minimizeCascade.cancel()
         focusScheduler.cancel()
 
         DispatchQueue.main.async {
@@ -730,6 +892,7 @@ private final class DesktopToggle {
 }
 
 private let desktopToggle = DesktopToggle()
+private let toastController = ToastController()
 
 // MARK: - Hot keys
 
@@ -748,6 +911,7 @@ private func hotKeyHandler(_ callRef: EventHandlerCallRef?,
     guard status == noErr, let id = HotKeyID(rawValue: hotKeyID.id) else {
         return OSStatus(eventNotHandledErr)
     }
+    showHotKeyToast(id)
     switch id {
     case .openFinder:
         openFinder()
@@ -757,6 +921,13 @@ private func hotKeyHandler(_ callRef: EventHandlerCallRef?,
         desktopToggle.toggle()
     }
     return noErr
+}
+
+private func showHotKeyToast(_ id: HotKeyID) {
+    guard AppSettings.showsToast else { return }
+    DispatchQueue.main.async {
+        toastController.show(id)
+    }
 }
 
 private func installHotKeyHandler() {
@@ -814,6 +985,7 @@ private final class ShortcutRecorderView: NSView {
     var onCancel: (() -> Void)?
 
     private(set) var isRecording = false
+    private var keyMonitor: Any?
 
     init(keyCode: UInt32, modifiers: UInt32) {
         self.keyCode = keyCode
@@ -826,6 +998,10 @@ private final class ShortcutRecorderView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        removeKeyMonitor()
     }
 
     override var acceptsFirstResponder: Bool { isFunctionEnabled }
@@ -841,10 +1017,7 @@ private final class ShortcutRecorderView: NSView {
         guard isFunctionEnabled else { return }
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
-        guard !isRecording else { return }
-        isRecording = true
-        needsDisplay = true
-        onBeginRecording?()
+        beginRecording()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -852,6 +1025,59 @@ private final class ShortcutRecorderView: NSView {
             super.keyDown(with: event)
             return
         }
+        // Normally the local monitor consumes keys first; this is a fallback.
+        _ = record(event)
+    }
+
+    /// Starts capturing keys. A local monitor is used because AppKit turns some
+    /// combinations such as ⌘esc and ⌃esc into `cancelOperation:` instead of
+    /// delivering them to `keyDown`, which made them impossible to record.
+    private func beginRecording() {
+        guard !isRecording else { return }
+        isRecording = true
+        needsDisplay = true
+        installKeyMonitor()
+        onBeginRecording?()
+    }
+
+    /// Stops recording without committing and without reporting a cancel.
+    func endRecording() {
+        guard isRecording else { return }
+        stopRecording()
+        if window?.firstResponder === self {
+            window?.makeFirstResponder(nil)
+        }
+    }
+
+    private func stopRecording() {
+        removeKeyMonitor()
+        isRecording = false
+        needsDisplay = true
+    }
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self = self, self.isRecording else { return event }
+            // Ignore keys aimed at another window (for example an alert sheet).
+            if let eventWindow = event.window, eventWindow !== self.window {
+                return event
+            }
+            return self.record(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+    }
+
+    /// Handles one key press. Returns true when the event was consumed.
+    private func record(_ event: NSEvent) -> Bool {
+        guard isRecording else { return false }
+        if event.isARepeat { return true }
 
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let active = flags.intersection([.command, .option, .control, .shift])
@@ -860,12 +1086,14 @@ private final class ShortcutRecorderView: NSView {
         // Escape on its own cancels recording.
         if pressedKeyCode == UInt32(kVK_Escape) && active.isEmpty {
             finish(commit: false)
-            return
+            return true
         }
 
-        guard active.contains(.command) || active.contains(.option) || active.contains(.control) else {
+        // Function keys work on their own; other keys need ⌘, ⌥ or ⌃.
+        let isFunctionKey = functionKeyNames[Int(pressedKeyCode)] != nil
+        guard active.contains(.command) || active.contains(.option) || active.contains(.control) || isFunctionKey else {
             NSSound.beep()
-            return
+            return true
         }
 
         var carbonModifiers: UInt32 = 0
@@ -874,28 +1102,26 @@ private final class ShortcutRecorderView: NSView {
         if active.contains(.shift) { carbonModifiers |= UInt32(shiftKey) }
         if active.contains(.command) { carbonModifiers |= UInt32(cmdKey) }
 
-        guard onCommit?(pressedKeyCode, carbonModifiers) ?? false else { return }
+        guard onCommit?(pressedKeyCode, carbonModifiers) ?? false else { return true }
         self.keyCode = pressedKeyCode
         self.modifiers = carbonModifiers
         finish(commit: true)
+        return true
     }
 
     override func resignFirstResponder() -> Bool {
         if isRecording {
-            isRecording = false
-            needsDisplay = true
+            stopRecording()
             onCancel?()
         }
         return true
     }
 
     private func finish(commit: Bool) {
-        isRecording = false
-        needsDisplay = true
+        endRecording()
         if !commit {
             onCancel?()
         }
-        window?.makeFirstResponder(nil)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -943,12 +1169,25 @@ private final class ShortcutRecorderView: NSView {
     }
 }
 
-private final class SettingsWindowController: NSWindowController {
+private final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
     private var recorders: [HotKeyID: ShortcutRecorderView] = [:]
     private var checkboxes: [HotKeyID: NSButton] = [:]
+    private var finderTargetLabel: NSTextField?
+    private var toastHoldField: NSTextField?
+    private var toastFadeField: NSTextField?
+    private var toastCheckbox: NSButton?
+    private var toastBackgroundWell: NSColorWell?
+    private var toastTextWell: NSColorWell?
+    private var statusIconCheckbox: NSButton?
+    private var saveButton: NSButton?
+    private var pendingFinderPath: String? = AppSettings.finderPath
+    private var hasUnsavedChanges = false {
+        didSet { saveButton?.isEnabled = hasUnsavedChanges }
+    }
+    weak var statusBarController: StatusBarController?
 
     init() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 264),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 500),
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
@@ -956,6 +1195,7 @@ private final class SettingsWindowController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)
+        window.delegate = self
         buildContent()
     }
 
@@ -964,58 +1204,142 @@ private final class SettingsWindowController: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
+    /// Closing without saving discards staged changes; global hot keys that were
+    /// unregistered for recording must be registered again.
+    func windowWillClose(_ notification: Notification) {
+        NSColorPanel.shared.close()
+        reloadFromSaved()
+    }
+
     func show() {
         guard let window = window else { return }
+        // Reopening after a close starts from the saved values; bringing an
+        // already visible window forward must keep staged edits.
+        if !window.isVisible {
+            reloadFromSaved()
+        }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
 
+    func controlTextDidChange(_ obj: Notification) {
+        markChanged()
+    }
+
+    private static let contentWidth: CGFloat = 560
+    private static let contentInset: CGFloat = 22
+
     private func buildContent() {
         guard let content = window?.contentView else { return }
 
-        let stack = NSStackView()
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
+        let root = NSStackView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 18
 
-        let header = makeHeaderRow()
-        stack.addArrangedSubview(header)
-        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-
+        var shortcutRows: [NSView] = [makeHeaderRow()]
         for id in HotKeyID.allCases {
-            let row = makeRow(for: id)
-            stack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            shortcutRows.append(makeRow(for: id))
+            if id == .openFinder {
+                shortcutRows.append(makeFinderTargetRow())
+            }
+        }
+        let shortcutsSection = makeSection("快捷键", rows: shortcutRows)
+
+        let showToastCheckbox = NSButton(checkboxWithTitle: "显示触发提示",
+                                         target: self,
+                                         action: #selector(toggleToast(_:)))
+        showToastCheckbox.state = AppSettings.showsToast ? .on : .off
+        showToastCheckbox.toolTip = "快捷键触发时在屏幕中央短暂显示该快捷键"
+        toastCheckbox = showToastCheckbox
+        let toastSection = makeSection("触发提示", rows: [
+            showToastCheckbox,
+            makeToastRow(),
+            makeToastColorRow(),
+        ])
+
+        let showIconCheckbox = NSButton(checkboxWithTitle: "在菜单栏显示图标",
+                                        target: self,
+                                        action: #selector(toggleStatusBarIcon(_:)))
+        showIconCheckbox.state = AppSettings.showsStatusBarIcon ? .on : .off
+        showIconCheckbox.toolTip = "关闭后应用仍在后台运行；再次打开 FinderHotKey 即可显示设置窗口"
+        statusIconCheckbox = showIconCheckbox
+        let menuSection = makeSection("菜单栏", rows: [showIconCheckbox])
+
+        for section in [shortcutsSection, toastSection, menuSection] {
+            root.addArrangedSubview(section)
+            section.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         }
 
-        let hint = NSTextField(wrappingLabelWithString:
-            "点击快捷键后按下新的组合键即可修改，按 Esc 取消。取消勾选可停用对应功能。所有修改立即生效并自动保存。")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-        hint.preferredMaxLayoutWidth = 500
-        stack.addArrangedSubview(hint)
-        hint.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        let divider = NSBox()
+        divider.boxType = .separator
+        root.addArrangedSubview(divider)
+        divider.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        root.setCustomSpacing(12, after: divider)
+
+        let note = NSTextField(wrappingLabelWithString:
+            "点击快捷键后按下新的组合键，按 Esc 取消。所有修改需点击“保存”才会生效并关闭窗口；直接关闭窗口会放弃修改。")
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = Self.contentWidth - Self.contentInset * 2
+        root.addArrangedSubview(note)
+        note.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        root.setCustomSpacing(14, after: note)
 
         let resetButton = NSButton(title: "恢复默认", target: self, action: #selector(resetDefaults))
         resetButton.bezelStyle = .rounded
+        let quitButton = NSButton(title: "退出", target: self, action: #selector(quitApp))
+        quitButton.bezelStyle = .rounded
+        quitButton.toolTip = "退出后快捷键将停止，直到重新打开应用或下次登录"
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let doneButton = NSButton(title: "完成", target: self, action: #selector(closeWindow))
-        doneButton.bezelStyle = .rounded
-        doneButton.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [resetButton, spacer, doneButton])
+        let saveButton = NSButton(title: "保存", target: self, action: #selector(saveAndClose))
+        saveButton.bezelStyle = .rounded
+        saveButton.keyEquivalent = "\r"
+        saveButton.isEnabled = false
+        saveButton.toolTip = "保存全部修改并生效"
+        self.saveButton = saveButton
+        let buttons = NSStackView(views: [quitButton, spacer, resetButton, saveButton])
         buttons.orientation = .horizontal
         buttons.alignment = .centerY
-        stack.addArrangedSubview(buttons)
-        buttons.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        root.addArrangedSubview(buttons)
+        buttons.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        content.addSubview(stack)
+        content.addSubview(root)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: Self.contentInset),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Self.contentInset),
+            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
         ])
+
+        content.layoutSubtreeIfNeeded()
+        let height = ceil(root.fittingSize.height) + 40
+        window?.setContentSize(NSSize(width: Self.contentWidth, height: height))
+        window?.center()
+        updateToastControlsEnabled()
+    }
+
+    private func makeSection(_ title: String, rows: [NSView]) -> NSStackView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleLabel.textColor = .secondaryLabelColor
+
+        let body = NSStackView()
+        body.orientation = .vertical
+        body.alignment = .leading
+        body.spacing = 10
+        for row in rows {
+            body.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        }
+
+        let section = NSStackView(views: [titleLabel, body])
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 7
+        body.widthAnchor.constraint(equalTo: section.widthAnchor).isActive = true
+        return section
     }
 
     private func makeHeaderRow() -> NSStackView {
@@ -1061,6 +1385,7 @@ private final class SettingsWindowController: NSWindowController {
             self?.commitShortcut(for: id, keyCode: keyCode, modifiers: modifiers) ?? false
         }
         recorder.onCancel = {
+            // Recording unregisters the hot keys; restore the saved ones.
             _ = applyHotKeys()
         }
         recorder.widthAnchor.constraint(equalToConstant: 170).isActive = true
@@ -1085,30 +1410,269 @@ private final class SettingsWindowController: NSWindowController {
         return row
     }
 
+    /// Folder picker row shown under “打开访达”.
+    private func makeFinderTargetRow() -> NSStackView {
+        let caption = NSTextField(labelWithString: "打开位置")
+        caption.font = .systemFont(ofSize: 11)
+        caption.textColor = .secondaryLabelColor
+        caption.widthAnchor.constraint(equalToConstant: 170).isActive = true
+
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        finderTargetLabel = label
+        updateFinderTargetLabel()
+
+        let chooseButton = NSButton(title: "选择…", target: self, action: #selector(chooseFinderTarget))
+        chooseButton.bezelStyle = .rounded
+        chooseButton.controlSize = .small
+        chooseButton.toolTip = "选择“打开访达”要打开的文件夹"
+
+        let row = NSStackView(views: [caption, label, trailingSpacer(), chooseButton])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        return row
+    }
+
+    /// Hold/fade timing for the trigger hint, in milliseconds.
+    private func makeToastRow() -> NSStackView {
+        let holdField = makeToastField(milliseconds: AppSettings.toastHoldMilliseconds)
+        holdField.toolTip = "提示保持完全显示的时间；这段时间结束后开始淡出（0–5000 毫秒）"
+        toastHoldField = holdField
+        let fadeField = makeToastField(milliseconds: AppSettings.toastFadeMilliseconds)
+        fadeField.toolTip = "从开始淡出到完全消失所用的时间（0–5000 毫秒）"
+        toastFadeField = fadeField
+
+        let row = NSStackView(views: [
+            indentSpacer(),
+            settingLabel("停留"),
+            holdField,
+            unitLabel("毫秒"),
+            columnGap(),
+            settingLabel("淡出"),
+            fadeField,
+            unitLabel("毫秒"),
+            trailingSpacer(),
+        ])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        return row
+    }
+
+    private func unitLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        return label
+    }
+
+    private func settingLabel(_ text: String) -> NSTextField {
+        let label = unitLabel(text)
+        label.alignment = .right
+        label.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        return label
+    }
+
+    private func indentSpacer() -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: 19).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return view
+    }
+
+    private func columnGap() -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return view
+    }
+
+    /// Aligns the second color well with the fade field above it.
+    private func colorColumnGap() -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: 62).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return view
+    }
+
+    private func trailingSpacer() -> NSView {
+        let view = NSView()
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    /// Background and text colors for the trigger hint, edited with the system
+    /// color picker.
+    private func makeToastColorRow() -> NSStackView {
+        let backgroundWell = makeColorWell(color: AppSettings.toastBackgroundColor,
+                                           action: #selector(toastBackgroundColorChanged(_:)),
+                                           toolTip: "触发提示的背景颜色，支持透明度")
+        toastBackgroundWell = backgroundWell
+        let textWell = makeColorWell(color: AppSettings.toastTextColor,
+                                     action: #selector(toastTextColorChanged(_:)),
+                                     toolTip: "触发提示的文字和快捷键颜色，支持透明度")
+        toastTextWell = textWell
+
+        let row = NSStackView(views: [
+            indentSpacer(),
+            settingLabel("背景"),
+            backgroundWell,
+            colorColumnGap(),
+            settingLabel("文字"),
+            textWell,
+            trailingSpacer(),
+        ])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        return row
+    }
+
+    private func makeColorWell(color: NSColor, action: Selector, toolTip: String) -> NSColorWell {
+        let well = NSColorWell()
+        well.color = color
+        well.target = self
+        well.action = action
+        well.isContinuous = true
+        if #available(macOS 14.0, *) {
+            well.supportsAlpha = true
+        }
+        NSColorPanel.shared.showsAlpha = true
+        well.toolTip = toolTip
+        well.translatesAutoresizingMaskIntoConstraints = false
+        well.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        well.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        return well
+    }
+
+    private func makeToastField(milliseconds: Int) -> NSTextField {
+        let field = NSTextField(string: "\(milliseconds)")
+        field.font = .systemFont(ofSize: 12)
+        field.alignment = .right
+        field.widthAnchor.constraint(equalToConstant: 52).isActive = true
+        field.delegate = self
+
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .none
+        formatter.allowsFloats = false
+        formatter.minimum = 0
+        formatter.maximum = 5000
+        field.formatter = formatter
+        return field
+    }
+
+    @objc private func toggleToast(_ sender: NSButton) {
+        updateToastControlsEnabled()
+        markChanged()
+    }
+
+    @objc private func toastBackgroundColorChanged(_ sender: NSColorWell) {
+        markChanged()
+    }
+
+    @objc private func toastTextColorChanged(_ sender: NSColorWell) {
+        markChanged()
+    }
+
+    private func updateToastControlsEnabled() {
+        let enabled = toastCheckbox?.state == .on
+        toastHoldField?.isEnabled = enabled
+        toastFadeField?.isEnabled = enabled
+        toastBackgroundWell?.isEnabled = enabled
+        toastTextWell?.isEnabled = enabled
+    }
+
+    private func committedToastMilliseconds(from field: NSTextField?, stored: Int) -> Int {
+        guard let field = field else { return stored }
+        // The text may still live in the field editor if editing did not end.
+        let text = (field.currentEditor()?.string ?? field.stringValue)
+            .trimmingCharacters(in: .whitespaces)
+        guard let value = Int(text) else {
+            field.integerValue = stored
+            return stored
+        }
+        let clamped = min(5000, max(0, value))
+        if clamped != value {
+            field.integerValue = clamped
+        }
+        return clamped
+    }
+
+    @objc private func chooseFinderTarget() {
+        if recorders.values.contains(where: { $0.isRecording }) {
+            stopRecordingAndReapplyHotKeys()
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "选择"
+        panel.message = "选择“打开访达”快捷键要打开的文件夹"
+        panel.directoryURL = URL(fileURLWithPath: pendingFinderPath ?? NSHomeDirectory())
+
+        if let window = window, window.isVisible {
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard response == .OK, let url = panel.url else { return }
+                self?.stageFinderPath(url.path)
+            }
+        } else if panel.runModal() == .OK, let url = panel.url {
+            stageFinderPath(url.path)
+        }
+    }
+
+    private func stageFinderPath(_ path: String) {
+        pendingFinderPath = path
+        updateFinderTargetLabel()
+        markChanged()
+    }
+
+    private func updateFinderTargetLabel() {
+        let path = pendingFinderPath ?? NSHomeDirectory()
+        let abbreviated = (path as NSString).abbreviatingWithTildeInPath
+        finderTargetLabel?.stringValue = pendingFinderPath == nil ? "主目录（\(abbreviated)）" : abbreviated
+        finderTargetLabel?.toolTip = path
+    }
+
     @objc private func toggleEnabled(_ sender: NSButton) {
         guard let id = HotKeyID(rawValue: UInt32(sender.tag)) else { return }
-        let enabled = sender.state == .on
-        HotKeySettings.setEnabled(enabled, for: id)
-        recorders[id]?.isFunctionEnabled = enabled
-        reportRegistrationFailures(applyHotKeys())
+        // Leave recording mode before the enabled state changes.
+        for recorder in recorders.values {
+            recorder.endRecording()
+        }
+        recorders[id]?.isFunctionEnabled = sender.state == .on
+        // endRecording does not restore the global hot keys by itself.
+        _ = applyHotKeys()
+        markChanged()
     }
 
     private func commitShortcut(for id: HotKeyID, keyCode: UInt32, modifiers: UInt32) -> Bool {
-        if let conflict = HotKeyID.allCases.first(where: {
-            $0 != id && HotKeySettings.keyCode($0) == keyCode && HotKeySettings.modifiers($0) == modifiers
+        if let conflict = HotKeyID.allCases.first(where: { other in
+            guard other != id, let recorder = recorders[other] else { return false }
+            return recorder.keyCode == keyCode && recorder.modifiers == modifiers
         }) {
             let alert = NSAlert()
             alert.messageText = "快捷键冲突"
             var detail = "“\(conflict.title)”已经使用了 \(shortcutDescription(keyCode: keyCode, modifiers: modifiers))。"
-            if !HotKeySettings.isEnabled(conflict) {
+            if checkboxes[conflict]?.state != .on {
                 detail += "该功能当前未启用，启用后会产生冲突。"
             }
             alert.informativeText = detail + "请换一个组合键。"
             show(alert)
             return false
         }
-        HotKeySettings.setShortcut(keyCode: keyCode, modifiers: modifiers, for: id)
-        reportRegistrationFailures(applyHotKeys())
+        // Recording unregisters the hot keys; keep the saved ones working until
+        // the user clicks 保存.
+        _ = applyHotKeys()
+        markChanged()
         return true
     }
 
@@ -1129,41 +1693,170 @@ private final class SettingsWindowController: NSWindowController {
     }
 
     @objc private func resetDefaults() {
-        HotKeySettings.resetAll()
+        // Stage the defaults; they are applied only after clicking 保存.
         for id in HotKeyID.allCases {
+            recorders[id]?.endRecording()
             recorders[id]?.isFunctionEnabled = true
             recorders[id]?.keyCode = id.defaultKeyCode
             recorders[id]?.modifiers = id.defaultModifiers
             checkboxes[id]?.state = .on
         }
-        reportRegistrationFailures(applyHotKeys())
+        window?.makeFirstResponder(nil)
+        _ = applyHotKeys()
+        toastHoldField?.integerValue = AppSettings.defaultToastHoldMilliseconds
+        toastFadeField?.integerValue = AppSettings.defaultToastFadeMilliseconds
+        toastCheckbox?.state = .on
+        toastBackgroundWell?.color = AppSettings.defaultToastBackgroundColor
+        toastTextWell?.color = AppSettings.defaultToastTextColor
+        updateToastControlsEnabled()
+        markChanged()
     }
 
-    @objc private func closeWindow() {
+    @objc private func saveAndClose() {
+        guard hasUnsavedChanges else { return }
+        // Commit the field editor first so a freshly typed timing counts.
+        window?.makeFirstResponder(nil)
+        for recorder in recorders.values {
+            recorder.endRecording()
+        }
+
+        let hold = committedToastMilliseconds(from: toastHoldField, stored: AppSettings.toastHoldMilliseconds)
+        let fade = committedToastMilliseconds(from: toastFadeField, stored: AppSettings.toastFadeMilliseconds)
+
+        if let conflict = stagedShortcutConflict() {
+            let alert = NSAlert()
+            alert.messageText = "快捷键冲突"
+            alert.informativeText = "“\(conflict.first.title)”和“\(conflict.second.title)”都使用了 "
+                + "\(shortcutDescription(keyCode: conflict.keyCode, modifiers: conflict.modifiers))。"
+                + "请先修改其中一个，再点击保存。"
+            show(alert)
+            return
+        }
+
+        for id in HotKeyID.allCases {
+            HotKeySettings.setEnabled(checkboxes[id]?.state == .on, for: id)
+            if let recorder = recorders[id] {
+                HotKeySettings.setShortcut(keyCode: recorder.keyCode,
+                                           modifiers: recorder.modifiers,
+                                           for: id)
+            }
+        }
+        AppSettings.setShowsToast(toastCheckbox?.state == .on)
+        AppSettings.setToastHoldMilliseconds(hold)
+        AppSettings.setToastFadeMilliseconds(fade)
+        if let color = toastBackgroundWell?.color {
+            AppSettings.setToastBackgroundColor(color)
+        }
+        if let color = toastTextWell?.color {
+            AppSettings.setToastTextColor(color)
+        }
+        let showsIcon = statusIconCheckbox.map { $0.state == .on } ?? AppSettings.showsStatusBarIcon
+        AppSettings.setShowsStatusBarIcon(showsIcon)
+        if let path = pendingFinderPath {
+            AppSettings.setFinderPath(path)
+        }
+
+        statusBarController?.setVisible(showsIcon)
+        toastController.refreshAppearance()
+        let failures = applyHotKeys()
+        reloadFromSaved()
         window?.orderOut(nil)
+        reportRegistrationFailures(failures)
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
+
+    @objc private func toggleStatusBarIcon(_ sender: NSButton) {
+        markChanged()
+    }
+
+    private func markChanged() {
+        hasUnsavedChanges = true
+    }
+
+    private func stagedShortcutConflict() -> (first: HotKeyID, second: HotKeyID, keyCode: UInt32, modifiers: UInt32)? {
+        var seen: [String: HotKeyID] = [:]
+        for id in HotKeyID.allCases where checkboxes[id]?.state == .on {
+            guard let recorder = recorders[id] else { continue }
+            let key = "\(recorder.keyCode)-\(recorder.modifiers)"
+            if let first = seen[key] {
+                return (first, id, recorder.keyCode, recorder.modifiers)
+            }
+            seen[key] = id
+        }
+        return nil
+    }
+
+    /// Restores every control from the persisted settings and forgets staged
+    /// changes. Global hot keys stop working while a shortcut is being recorded,
+    /// so re-register them if that was the case.
+    private func reloadFromSaved() {
+        let wasRecording = recorders.values.contains { $0.isRecording }
+        for id in HotKeyID.allCases {
+            recorders[id]?.endRecording()
+            recorders[id]?.isFunctionEnabled = HotKeySettings.isEnabled(id)
+            recorders[id]?.keyCode = HotKeySettings.keyCode(id)
+            recorders[id]?.modifiers = HotKeySettings.modifiers(id)
+            checkboxes[id]?.state = HotKeySettings.isEnabled(id) ? .on : .off
+        }
+        pendingFinderPath = AppSettings.finderPath
+        updateFinderTargetLabel()
+        toastHoldField?.integerValue = AppSettings.toastHoldMilliseconds
+        toastFadeField?.integerValue = AppSettings.toastFadeMilliseconds
+        toastCheckbox?.state = AppSettings.showsToast ? .on : .off
+        toastBackgroundWell?.color = AppSettings.toastBackgroundColor
+        toastTextWell?.color = AppSettings.toastTextColor
+        statusIconCheckbox?.state = AppSettings.showsStatusBarIcon ? .on : .off
+        updateToastControlsEnabled()
+        hasUnsavedChanges = false
+        if wasRecording {
+            _ = applyHotKeys()
+        }
+    }
+
+    private func stopRecordingAndReapplyHotKeys() {
+        for id in HotKeyID.allCases {
+            recorders[id]?.endRecording()
+        }
+        _ = applyHotKeys()
     }
 }
 
 private final class StatusBarController: NSObject {
-    private let statusItem: NSStatusItem
     private let settingsController: SettingsWindowController
+    private var statusItem: NSStatusItem?
 
     init(settingsController: SettingsWindowController) {
         self.settingsController = settingsController
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
+        setVisible(AppSettings.showsStatusBarIcon)
+    }
 
-        if let button = statusItem.button {
-            if let image = NSImage(systemSymbolName: "command", accessibilityDescription: "FinderHotKey") {
-                image.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "⌘"
+    /// Shows or removes the menu bar icon immediately.
+    func setVisible(_ visible: Bool) {
+        if visible {
+            guard statusItem == nil else { return }
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            if let button = item.button {
+                if let image = NSImage(systemSymbolName: "command", accessibilityDescription: "FinderHotKey") {
+                    image.isTemplate = true
+                    button.image = image
+                } else {
+                    button.title = "⌘"
+                }
+                button.target = self
+                button.action = #selector(handleClick(_:))
+                button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+                button.toolTip = "FinderHotKey：点击打开设置，右键查看更多"
             }
-            button.target = self
-            button.action = #selector(handleClick(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.toolTip = "FinderHotKey：点击打开设置"
+            statusItem = item
+        } else {
+            if let statusItem = statusItem {
+                NSStatusBar.system.removeStatusItem(statusItem)
+            }
+            statusItem = nil
         }
     }
 
@@ -1176,6 +1869,7 @@ private final class StatusBarController: NSObject {
     }
 
     private func showMenu() {
+        guard let statusItem = statusItem else { return }
         let menu = NSMenu()
 
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: "")
@@ -1201,6 +1895,158 @@ private final class StatusBarController: NSObject {
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
+/// Small centered overlay that confirms a hot key fired. It never receives
+/// mouse events and hides itself after the configured hold and fade times.
+private final class ToastController {
+    private let panel: NSPanel
+    private let content: ToastContentView
+    private var hideWorkItem: DispatchWorkItem?
+    private var fadeGeneration = 0
+
+    init() {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 156, height: 120),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered,
+                            defer: true)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        // A window shadow around transparent content shows up as a light rim.
+        panel.hasShadow = false
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.ignoresMouseEvents = true
+        panel.isMovable = false
+        panel.hidesOnDeactivate = false
+        panel.animationBehavior = .none
+        panel.isReleasedWhenClosed = false
+        self.panel = panel
+
+        let content = ToastContentView()
+        content.autoresizingMask = [.width, .height]
+        panel.contentView = content
+        self.content = content
+    }
+
+    func show(_ id: HotKeyID) {
+        content.update(keyCode: HotKeySettings.keyCode(id),
+                       modifiers: HotKeySettings.modifiers(id),
+                       background: AppSettings.toastBackgroundColor,
+                       text: AppSettings.toastTextColor)
+        let size = content.preferredSize
+        panel.setContentSize(size)
+
+        // Center on the screen the user is working on (the one with the key
+        // window); never follows the mouse, matching system-default behavior.
+        if let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: (visible.midX - size.width / 2).rounded(),
+                                         y: (visible.midY - size.height / 2).rounded()))
+        }
+
+        fadeGeneration += 1
+        let generation = fadeGeneration
+        hideWorkItem?.cancel()
+        panel.contentView?.layer?.removeAllAnimations()
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+
+        let hold = AppSettings.toastHoldMilliseconds
+        let fade = AppSettings.toastFadeMilliseconds
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            guard fade > 0 else {
+                self.panel.orderOut(nil)
+                return
+            }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = Double(fade) / 1000
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.panel.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self = self, self.fadeGeneration == generation else { return }
+                self.panel.orderOut(nil)
+                self.panel.alphaValue = 1
+            })
+        }
+        hideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(hold) / 1000, execute: work)
+    }
+
+    /// Applies newly chosen colors to a hint that is currently on screen.
+    func refreshAppearance() {
+        guard panel.isVisible else { return }
+        content.applyColors(background: AppSettings.toastBackgroundColor,
+                            text: AppSettings.toastTextColor)
+    }
+}
+
+/// WeChat-style card showing only the shortcut that fired: solid dark gray,
+/// large white type, generous corner radius. It draws its own background so the
+/// panel has no frame or margin around it.
+private final class ToastContentView: NSView {
+    private static let shortcutFont = NSFont.systemFont(ofSize: 32, weight: .medium)
+    private static let cornerRadius: CGFloat = 10
+    private static let minimumWidth: CGFloat = 132
+    private static let height: CGFloat = 120
+    private static let horizontalPadding: CGFloat = 28
+
+    private let shortcutLabel = NSTextField(labelWithString: "")
+    private var shortcut = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = Self.cornerRadius
+        layer?.masksToBounds = true
+
+        shortcutLabel.translatesAutoresizingMaskIntoConstraints = false
+        shortcutLabel.alignment = .center
+        shortcutLabel.maximumNumberOfLines = 1
+        addSubview(shortcutLabel)
+
+        NSLayoutConstraint.activate([
+            shortcutLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            shortcutLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            shortcutLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor,
+                                                   constant: Self.horizontalPadding),
+            shortcutLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor,
+                                                    constant: -Self.horizontalPadding),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(keyCode: UInt32,
+                modifiers: UInt32,
+                background: NSColor,
+                text: NSColor) {
+        shortcut = shortcutHUDText(keyCode: keyCode, modifiers: modifiers)
+        applyColors(background: background, text: text)
+    }
+
+    func applyColors(background: NSColor, text: NSColor) {
+        layer?.backgroundColor = background.cgColor
+        shortcutLabel.attributedStringValue = NSAttributedString(
+            string: shortcut,
+            attributes: [
+                .font: Self.shortcutFont,
+                .foregroundColor: text,
+            ]
+        )
+    }
+
+    var preferredSize: NSSize {
+        // Measure the text itself: the label may currently be squeezed by the
+        // panel's previous, narrower size.
+        let textSize = shortcutLabel.attributedStringValue.size()
+        return NSSize(width: max(Self.minimumWidth,
+                                 ceil(textSize.width) + Self.horizontalPadding * 2),
+                      height: Self.height)
+    }
+}
+
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     var settingsController: SettingsWindowController?
 
@@ -1219,6 +2065,7 @@ private let settingsController = SettingsWindowController()
 private let appDelegate = AppDelegate()
 private let statusBarController = StatusBarController(settingsController: settingsController)
 
+settingsController.statusBarController = statusBarController
 appDelegate.settingsController = settingsController
 app.delegate = appDelegate
 
@@ -1236,7 +2083,5 @@ if !launchedByAgent {
         settingsController.reportRegistrationFailures(failures)
     }
 }
-
-_ = statusBarController
 
 app.run()
