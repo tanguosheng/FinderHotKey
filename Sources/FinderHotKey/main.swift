@@ -172,6 +172,21 @@ private enum AppSettings {
     static func setToastFadeMilliseconds(_ value: Int) {
         UserDefaults.standard.set(min(5000, max(0, value)), forKey: toastFadeKey)
     }
+
+    private static let unminimizeActivatedAppKey = "behavior.unminimizeActivatedApp"
+
+    /// Restore an app's minimized windows when it is activated while none of
+    /// its windows are visible. Off by default.
+    static var unminimizeActivatedApp: Bool {
+        guard let number = UserDefaults.standard.object(forKey: unminimizeActivatedAppKey) as? NSNumber else {
+            return false
+        }
+        return number.boolValue
+    }
+
+    static func setUnminimizeActivatedApp(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: unminimizeActivatedAppKey)
+    }
 }
 
 private var hotKeyRefs: [EventHotKeyRef] = []
@@ -593,6 +608,21 @@ private final class MinimizedWindowStore {
         return entries.contains { $0.pid == pid && framesMatch($0.frame, frame) }
     }
 
+    /// True when this app had a window minimized by the cascade just now. Such a
+    /// window belongs to the user's active Cmd+Esc gesture and must not be
+    /// restored by the auto-unminimize feature.
+    func hasRecentMinimization(pid: pid_t) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneLocked()
+        let cutoff = Date().addingTimeInterval(-restoreSuppression)
+        return entries.contains { $0.pid == pid && $0.date > cutoff }
+    }
+
+    /// Kept short so switching back with Cmd+Tab right after minimizing still
+    /// restores; the held-modifier guard covers the longer Cmd+Esc gesture.
+    private let restoreSuppression: TimeInterval = 0.6
+
     private func pruneLocked() {
         let now = Date()
         entries.removeAll { now.timeIntervalSince($0.date) > lifetime }
@@ -713,6 +743,15 @@ private final class FocusScheduler {
         return true
     }
 
+    /// True when the app was brought forward by the cascade itself rather than
+    /// by the user switching to it.
+    func wasActivatedByCascade(pid: pid_t) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneExpectedActivationsLocked()
+        return expectedActivations[pid] != nil
+    }
+
     private func applicationDidActivate(_ notification: Notification) {
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         // Clicking the Finder desktop does not cancel the cascade.
@@ -726,6 +765,87 @@ private final class FocusScheduler {
 }
 
 private let focusScheduler = FocusScheduler()
+
+// MARK: - Restore minimized windows on activation
+
+/// Cmd+Tab only activates an app; if every window of that app is minimized the
+/// switch appears to do nothing. This observer restores those windows once the
+/// activation has landed. Finder is skipped because clicking the desktop also
+/// activates it, and popping its windows up there would be surprising.
+private final class ActivationUnminimizer {
+    private let queue = DispatchQueue(label: "local.tgs.finderhotkey.unminimize", qos: .userInitiated)
+    private var observer: NSObjectProtocol?
+
+    init() {
+        observer = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.applicationDidActivate(notification)
+        }
+    }
+
+    deinit {
+        if let observer = observer {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+    }
+
+    private func applicationDidActivate(_ notification: Notification) {
+        guard AppSettings.unminimizeActivatedApp,
+              isTrusted(),
+              let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.processIdentifier != getpid(),
+              app.activationPolicy == .regular,
+              app.bundleIdentifier != "com.apple.finder",
+              // Activations caused by the Cmd+Esc cascade are not a user switch.
+              !focusScheduler.wasActivatedByCascade(pid: app.processIdentifier) else { return }
+        let pid = app.processIdentifier
+        // Let the switch finish before querying AX; unminimizing while the
+        // activation is still in flight can be dropped by the app.
+        queue.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.restoreIfNoVisibleWindow(pid: pid)
+        }
+    }
+
+    /// While the hot key's modifiers are still down the user is in the middle of
+    /// a Cmd+Esc cascade, and restoring would fight it. Cmd+Tab only activates
+    /// the app after Command is released, so a real switch is not suppressed.
+    private func gestureModifiersHeld() -> Bool {
+        let flags = CGEventSource.flagsState(.combinedSessionState)
+        return flags.contains(.maskCommand) || flags.contains(.maskAlternate) || flags.contains(.maskControl)
+    }
+
+    private func restoreIfNoVisibleWindow(pid: pid_t) {
+        // The user may have switched away again before this ran.
+        guard AppSettings.unminimizeActivatedApp,
+              !gestureModifiersHeld(),
+              !minimizedWindowStore.hasRecentMinimization(pid: pid),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, 1.0)
+        guard let windows = copyAttribute(appElement, kAXWindowsAttribute as String) as? [AXUIElement],
+              !windows.isEmpty else { return }
+
+        var visibleCount = 0
+        var minimized: [AXUIElement] = []
+        for window in windows {
+            if isMinimized(window) {
+                minimized.append(window)
+            } else {
+                visibleCount += 1
+            }
+        }
+        guard visibleCount == 0 else { return }
+        for window in minimized {
+            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+    }
+}
+
+private let activationUnminimizer = ActivationUnminimizer()
 
 // MARK: - Minimize front window (Cmd + Esc)
 
@@ -770,7 +890,7 @@ private final class MinimizeCascade {
         lock.unlock()
         queue.async {
             guard self.isCurrent(gen) else { return }
-            self.minimizeFrontWindow()
+            self.minimizeFrontWindow(generation: gen)
         }
     }
 
@@ -786,7 +906,7 @@ private final class MinimizeCascade {
         return generation == gen
     }
 
-    private func minimizeFrontWindow() {
+    private func minimizeFrontWindow(generation: UInt64) {
         guard let candidate = cascadeCandidates(limit: 1).first else {
             focusScheduler.cancel()
             return
@@ -797,7 +917,11 @@ private final class MinimizeCascade {
         // to a window behind it: that would look like the wrong window vanished.
         for attempt in 0..<2 {
             if attempt > 0 { usleep(60_000) }
+            // Cancelling (Show Desktop) must stop work that is already resolving
+            // a window, not only the requests still waiting in the queue.
+            guard isCurrent(generation) else { return }
             guard let match = resolveWindow(pid: candidate.pid, frame: candidate.frame) else { continue }
+            guard isCurrent(generation) else { return }
             guard AXUIElementSetAttributeValue(match.window,
                                                kAXMinimizedAttribute as CFString,
                                                kCFBooleanTrue) == .success else { continue }
@@ -896,6 +1020,78 @@ private let toastController = ToastController()
 
 // MARK: - Hot keys
 
+/// One physical press must produce one action. A second event can follow while
+/// the key is still down (held-key repeat, key chatter, or a duplicate
+/// delivery); those are swallowed. The gate re-arms on the Carbon release event
+/// and, as a fallback, once a short poll sees the physical key up. The minimum
+/// interval absorbs a bounce whose release is too brief for the poll to see,
+/// while staying well below a human double tap.
+private final class HotKeyReleaseGate {
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "local.tgs.finderhotkey.keyrelease", qos: .userInteractive)
+    private var isReady = true
+    private var lastAccepted: UInt64 = 0
+    private var generation: UInt64 = 0
+    private var timer: DispatchSourceTimer?
+
+    private let minimumInterval: UInt64 = 80_000_000
+    private let pollInterval = DispatchTimeInterval.milliseconds(10)
+
+    /// Returns true once per physical key press.
+    func consume(keyCode: UInt32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard isReady, now &- lastAccepted >= minimumInterval else { return false }
+        isReady = false
+        lastAccepted = now
+        generation &+= 1
+        startPollingLocked(keyCode: keyCode, generation: generation)
+        return true
+    }
+
+    /// Re-arms from the Carbon release event, which is authoritative.
+    func rearm() {
+        lock.lock()
+        isReady = true
+        generation &+= 1
+        timer?.cancel()
+        timer = nil
+        lock.unlock()
+    }
+
+    private func startPollingLocked(keyCode: UInt32, generation: UInt64) {
+        timer?.cancel()
+        let poll = DispatchSource.makeTimerSource(queue: queue)
+        poll.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
+        poll.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            guard !CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(keyCode)) else { return }
+            self.lock.lock()
+            if self.generation == generation {
+                self.isReady = true
+                self.timer?.cancel()
+                self.timer = nil
+            }
+            self.lock.unlock()
+        }
+        timer = poll
+        poll.resume()
+    }
+}
+
+private let openFinderKeyGate = HotKeyReleaseGate()
+private let minimizeKeyGate = HotKeyReleaseGate()
+private let desktopToggleKeyGate = HotKeyReleaseGate()
+
+private func repeatGate(for id: HotKeyID) -> HotKeyReleaseGate {
+    switch id {
+    case .openFinder: return openFinderKeyGate
+    case .minimizeFrontWindow: return minimizeKeyGate
+    case .toggleDesktop: return desktopToggleKeyGate
+    }
+}
+
 private func hotKeyHandler(_ callRef: EventHandlerCallRef?,
                            _ event: EventRef?,
                            _ userData: UnsafeMutableRawPointer?) -> OSStatus {
@@ -910,6 +1106,15 @@ private func hotKeyHandler(_ callRef: EventHandlerCallRef?,
                                    &hotKeyID)
     guard status == noErr, let id = HotKeyID(rawValue: hotKeyID.id) else {
         return OSStatus(eventNotHandledErr)
+    }
+    // The release event re-arms the gate; only a fresh press runs the action.
+    if GetEventKind(event) == UInt32(kEventHotKeyReleased) {
+        repeatGate(for: id).rearm()
+        return noErr
+    }
+    // A held key keeps producing events; only the first one counts.
+    guard repeatGate(for: id).consume(keyCode: HotKeySettings.keyCode(id)) else {
+        return noErr
     }
     showHotKeyToast(id)
     switch id {
@@ -931,9 +1136,18 @@ private func showHotKeyToast(_ id: HotKeyID) {
 }
 
 private func installHotKeyHandler() {
-    var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                  eventKind: UInt32(kEventHotKeyPressed))
-    InstallEventHandler(GetApplicationEventTarget(), hotKeyHandler, 1, &eventType, nil, nil)
+    var eventTypes = [
+        EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                      eventKind: UInt32(kEventHotKeyPressed)),
+        EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                      eventKind: UInt32(kEventHotKeyReleased)),
+    ]
+    InstallEventHandler(GetApplicationEventTarget(),
+                        hotKeyHandler,
+                        eventTypes.count,
+                        &eventTypes,
+                        nil,
+                        nil)
 }
 
 private func unregisterHotKeys() {
@@ -1179,6 +1393,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
     private var toastBackgroundWell: NSColorWell?
     private var toastTextWell: NSColorWell?
     private var statusIconCheckbox: NSButton?
+    private var unminimizeCheckbox: NSButton?
     private var saveButton: NSButton?
     private var pendingFinderPath: String? = AppSettings.finderPath
     private var hasUnsavedChanges = false {
@@ -1247,6 +1462,14 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         }
         let shortcutsSection = makeSection("快捷键", rows: shortcutRows)
 
+        let unminimizeCheckbox = NSButton(checkboxWithTitle: "切到窗口已全部最小化的应用时自动还原",
+                                          target: self,
+                                          action: #selector(toggleUnminimizeOnActivate(_:)))
+        unminimizeCheckbox.state = AppSettings.unminimizeActivatedApp ? .on : .off
+        unminimizeCheckbox.toolTip = "切换到所有窗口都已最小化的应用时，自动还原它的最小化窗口；“访达”不处理，避免点击桌面时误触发"
+        self.unminimizeCheckbox = unminimizeCheckbox
+        let behaviorSection = makeSection("窗口行为", rows: [unminimizeCheckbox])
+
         let showToastCheckbox = NSButton(checkboxWithTitle: "显示触发提示",
                                          target: self,
                                          action: #selector(toggleToast(_:)))
@@ -1267,7 +1490,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         statusIconCheckbox = showIconCheckbox
         let menuSection = makeSection("菜单栏", rows: [showIconCheckbox])
 
-        for section in [shortcutsSection, toastSection, menuSection] {
+        for section in [shortcutsSection, behaviorSection, toastSection, menuSection] {
             root.addArrangedSubview(section)
             section.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         }
@@ -1708,6 +1931,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         toastCheckbox?.state = .on
         toastBackgroundWell?.color = AppSettings.defaultToastBackgroundColor
         toastTextWell?.color = AppSettings.defaultToastTextColor
+        unminimizeCheckbox?.state = .off
         updateToastControlsEnabled()
         markChanged()
     }
@@ -1752,6 +1976,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         }
         let showsIcon = statusIconCheckbox.map { $0.state == .on } ?? AppSettings.showsStatusBarIcon
         AppSettings.setShowsStatusBarIcon(showsIcon)
+        AppSettings.setUnminimizeActivatedApp(unminimizeCheckbox?.state == .on)
         if let path = pendingFinderPath {
             AppSettings.setFinderPath(path)
         }
@@ -1769,6 +1994,10 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
     }
 
     @objc private func toggleStatusBarIcon(_ sender: NSButton) {
+        markChanged()
+    }
+
+    @objc private func toggleUnminimizeOnActivate(_ sender: NSButton) {
         markChanged()
     }
 
@@ -1809,6 +2038,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         toastBackgroundWell?.color = AppSettings.toastBackgroundColor
         toastTextWell?.color = AppSettings.toastTextColor
         statusIconCheckbox?.state = AppSettings.showsStatusBarIcon ? .on : .off
+        unminimizeCheckbox?.state = AppSettings.unminimizeActivatedApp ? .on : .off
         updateToastControlsEnabled()
         hasUnsavedChanges = false
         if wasRecording {
@@ -2060,6 +2290,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
+/// The installed app and a copy in dist/ share a bundle identifier, register
+/// the same global hot keys and would both act on every press. Keep a single
+/// instance; during an upgrade the previous copy may still be exiting, so wait
+/// briefly before stepping aside.
+private let otherInstances: () -> [NSRunningApplication] = {
+    let bundleID = Bundle.main.bundleIdentifier ?? "local.tgs.finderhotkey"
+    return NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        .filter { $0.processIdentifier != getpid() }
+}
+var waitAttempts = 0
+while !otherInstances().isEmpty && waitAttempts < 15 {
+    usleep(100_000)
+    waitAttempts += 1
+}
+if !otherInstances().isEmpty {
+    // A successful exit matters: the LaunchAgent only relaunches failures.
+    exit(0)
+}
 
 private let settingsController = SettingsWindowController()
 private let appDelegate = AppDelegate()
