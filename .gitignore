@@ -1,35 +1,25 @@
-HELP.md
-target/
-!.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
+# macOS
+.DS_Store
+._*
 
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
+# Swift Package Manager
+.build/
+.swiftpm/
 
-### IntelliJ IDEA ###
-.idea
-*.iws
-*.iml
-*.ipr
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
+# Build output (Scripts/build-app.sh, Scripts/build-pkg.sh)
 build/
-!**/src/main/**/build/
-!**/src/test/**/build/
+dist/
+*.pkg
+*.dmg
 
-### VS Code ###
+# Xcode
+DerivedData/
+xcuserdata/
+
+# Editors
 .vscode/
-!1:/logs/*
+.idea/
+
+# Logs
+*.log
 logs/
